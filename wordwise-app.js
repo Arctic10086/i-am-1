@@ -47,9 +47,9 @@
   ];
 
   const DECKS = {
-    cet4: { name: '四级 · 乱序（示例）', desc: '示例子集', words: ['interaction', 'participate', 'strategy', 'obstacle', 'psychological', 'voluntary', 'contemporary', 'negotiate', 'primary', 'crucial'] },
-    cet6: { name: '六级 · 乱序（示例）', desc: '示例子集', words: ['theory', 'signal', 'vehicle', 'tolerance', 'individual', 'access', 'alternative', 'generous', 'depressed', 'automatic'] },
-    shuffle: { name: '综合 · 乱序（示例）', desc: '30 词演示', words: null }
+    cet4: { name: '四级 · 乱序', desc: '加载中…', words: null },
+    cet6: { name: '六级 · 乱序', desc: '加载中…', words: null },
+    shuffle: { name: '四六级 · 综合乱序', desc: '加载中…', words: null }
   };
 
   function todayISO() {
@@ -195,6 +195,19 @@
     return m;
   }
 
+  /** @param {{ words?: [string, string][] }} pack */
+  function entriesFromCetPack(pack) {
+    const pairs = pack.words || [];
+    return pairs.map(([word, translation]) => ({
+      word,
+      translation,
+      phonetic: '',
+      definition: '',
+      exchange: '',
+      pos: ''
+    }));
+  }
+
   function pickDistractors(target, pool, lexicon, n) {
     const t = target.word;
     const senses = allSenses(target.translation);
@@ -252,6 +265,7 @@
       const lexicon = ref(buildLexiconMap(SAMPLE_LEXICON));
       const deckKeys = Object.keys(DECKS);
       const decks = DECKS;
+      const lexiconBundlesLoading = ref(true);
 
       const sessionQueue = ref([]);
       const sessionIndex = ref(0);
@@ -557,6 +571,10 @@
       }
 
       function startSession(mode) {
+        if (lexiconBundlesLoading.value) {
+          showToast('词库正在加载，请稍候');
+          return;
+        }
         sessionMode.value = mode;
         metaChoice.value = null;
         uncertain.value = false;
@@ -653,7 +671,8 @@
           maybeAutoSpeak();
           return;
         }
-        buildNextQuizType();
+        if (kind === 'know') buildQuiz('word2zh');
+        else buildNextQuizType();
         view.value = 'quiz';
         resetHints();
         scheduleMetaHint();
@@ -688,9 +707,8 @@
 
       function buildQuiz(type) {
         const e = currentEntry.value;
-        const poolWords = Array.from(lexicon.value.keys());
-        const deckWords = (decks[state.value.activeDeck] && decks[state.value.activeDeck].words) || poolWords;
-        const distractors = pickDistractors(e, deckWords, lexicon.value, 3);
+        const poolWords = shuffle(Array.from(lexicon.value.keys()));
+        const distractors = pickDistractors(e, poolWords, lexicon.value, 3);
         const correctSense = firstSense(e.translation);
         if (type === 'word2zh' || type === 'listen2zh') {
           const opts = shuffle([
@@ -1015,16 +1033,58 @@
       onMounted(() => {
         const ex = state.value.lexiconExtra || [];
         if (ex.length) lexicon.value = buildLexiconMap(SAMPLE_LEXICON.concat(ex));
-        try {
-          const blob = new Blob([document.getElementById('wordwise-manifest-json').textContent], { type: 'application/json' });
-          const u = URL.createObjectURL(blob);
-          let link = document.querySelector('link[rel="manifest"]');
-          if (!link) { link = document.createElement('link'); link.rel = 'manifest'; document.head.appendChild(link); }
-          link.href = u;
-        } catch (_) {}
-        if ('serviceWorker' in navigator) {
-          navigator.serviceWorker.register('wordwise-sw.js').catch(() => {});
-        }
+        lexiconBundlesLoading.value = true;
+        Promise.all([
+          fetchJSON('./data/lexicon-cet4.json', 90000),
+          fetchJSON('./data/lexicon-cet6.json', 90000)
+        ])
+          .then(([p4, p6]) => {
+            const e4 = entriesFromCetPack(p4);
+            const e6 = entriesFromCetPack(p6);
+            const m = new Map(lexicon.value);
+            e4.forEach((ent) => { m.set(normWord(ent.word), ent); });
+            e6.forEach((ent) => { m.set(normWord(ent.word), ent); });
+            lexicon.value = m;
+            if (p4 && p4.name) decks.cet4.name = p4.name;
+            if (p6 && p6.name) decks.cet6.name = p6.name;
+            decks.cet4.desc = '大学英语四级词库';
+            decks.cet6.desc = '大学英语六级词库';
+            const order4 = e4.map((x) => x.word);
+            const order6 = e6.map((x) => x.word);
+            decks.cet4.words = order4;
+            decks.cet6.words = order6;
+            const seen = new Set();
+            const combo = [];
+            for (const w of order4) {
+              const k = normWord(w);
+              if (!seen.has(k)) { seen.add(k); combo.push(w); }
+            }
+            for (const w of order6) {
+              const k = normWord(w);
+              if (!seen.has(k)) { seen.add(k); combo.push(w); }
+            }
+            decks.shuffle.desc = '四级+六级综合词库';
+            decks.shuffle.words = combo;
+          })
+          .catch(() => {
+            showToast('四六级词库文件加载失败，将使用内置示例');
+            decks.cet4.desc = '内置示例词表（加载失败回退）';
+            decks.cet6.desc = '内置示例词表（加载失败回退）';
+            decks.shuffle.desc = '内置示例词表（加载失败回退）';
+          })
+          .finally(() => {
+            lexiconBundlesLoading.value = false;
+            try {
+              const blob = new Blob([document.getElementById('wordwise-manifest-json').textContent], { type: 'application/json' });
+              const u = URL.createObjectURL(blob);
+              let link = document.querySelector('link[rel="manifest"]');
+              if (!link) { link = document.createElement('link'); link.rel = 'manifest'; document.head.appendChild(link); }
+              link.href = u;
+            } catch (_) {}
+            if ('serviceWorker' in navigator) {
+              navigator.serviceWorker.register('wordwise-sw.js').catch(() => {});
+            }
+          });
       });
 
       return {
@@ -1105,7 +1165,8 @@
         refreshStats,
         saveSettings,
         onCsvFile,
-        persist
+        persist,
+        lexiconBundlesLoading
       };
     }
   }).mount('#app');
