@@ -2,6 +2,7 @@
   const { createApp, ref, computed, watch, onMounted, nextTick } = Vue;
 
   const STORAGE_KEY = 'wordwise_v1';
+  const APP_NAME = 'I am 1';
 
   const QUOTES = [
     '日积跬步，终至千里。',
@@ -79,7 +80,8 @@
       tempWords: [],
       activeDeck: 'cet4',
       notebook: [],
-      lexiconExtra: []
+      lexiconExtra: [],
+      morningReviewPromptDate: ''
     };
   }
 
@@ -145,6 +147,8 @@
     const it = idx('translation');
     const ix = idx('exchange');
     const ipos = idx('pos');
+    const isy = idx('synonyms');
+    const ira = idx('rootaffix');
     const out = [];
     for (let r = 1; r < rows.length; r++) {
       const row = rows[r];
@@ -157,7 +161,9 @@
         definition: idf >= 0 ? row[idf] : '',
         translation: it >= 0 ? row[it] : '',
         exchange: ix >= 0 ? row[ix] : '',
-        pos: ipos >= 0 ? row[ipos] : ''
+        pos: ipos >= 0 ? row[ipos] : '',
+        synonyms: isy >= 0 ? row[isy] : '',
+        rootAffix: ira >= 0 ? row[ira] : ''
       });
     }
     return out;
@@ -204,7 +210,9 @@
       phonetic: '',
       definition: '',
       exchange: '',
-      pos: ''
+      pos: '',
+      synonyms: '',
+      rootAffix: ''
     }));
   }
 
@@ -257,6 +265,23 @@
       .finally(() => clearTimeout(t));
   }
 
+  function parseHzImage(j) {
+    if (!j || typeof j !== 'object') return '';
+    const cand = j.img || j.pic || j.url || j.image || j.link;
+    if (typeof cand === 'string' && /^https?:\/\//i.test(cand)) return cand;
+    if (j.data) {
+      const d = j.data;
+      if (typeof d === 'string' && /^https?:\/\//i.test(d)) return d;
+      if (Array.isArray(d) && d[0]) {
+        const x = d[0];
+        if (typeof x === 'string') return x;
+        if (x && typeof x === 'object') return x.url || x.img || x.pic || '';
+      }
+      if (d && typeof d === 'object') return d.url || d.img || d.pic || '';
+    }
+    return '';
+  }
+
   createApp({
     setup() {
       const view = ref('home');
@@ -294,6 +319,14 @@
       const metaTimer = ref(null);
       const studyStart = ref(null);
       const detailReturnView = ref(null);
+      const detailScreenImage = ref('');
+      const detailFromStrikes = ref(false);
+      const sessionReviewAlternate = ref(false);
+      const pickPlanRows = ref([]);
+      const pickPlanSearchQ = ref('');
+      const pickPlanSearchLoading = ref(false);
+      const calendarOffset = ref(0);
+      const calTouch = ref({ x0: 0, t0: 0 });
 
       const settings = computed({
         get: () => state.value.settings,
@@ -325,15 +358,19 @@
       const calDays = computed(() => {
         const out = [];
         const now = new Date();
-        for (let i = -6; i <= 0; i++) {
-          const d = new Date(now);
-          d.setDate(d.getDate() + i);
+        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const center = new Date(todayStart);
+        center.setDate(center.getDate() - calendarOffset.value);
+        for (let i = -3; i <= 3; i++) {
+          const d = new Date(center);
+          d.setDate(center.getDate() + i);
           const key = d.toISOString().slice(0, 10);
+          const isToday = d.getTime() === todayStart.getTime();
           out.push({
             key,
             label: `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`,
             signed: !!state.value.signIn.dates[key],
-            today: i === 0
+            today: isToday
           });
         }
         return out;
@@ -454,6 +491,18 @@
         return out;
       });
 
+      const detailSynonymsLine = computed(() => {
+        if (!detailEntry.value) return '';
+        const s = detailEntry.value.synonyms;
+        return (s && String(s).trim()) || '（导入扩展词典后显示同义词）';
+      });
+
+      const detailRootAffixLine = computed(() => {
+        if (!detailEntry.value) return '';
+        const s = detailEntry.value.rootAffix;
+        return (s && String(s).trim()) || '（导入扩展词典后显示词根、词缀分析）';
+      });
+
       function deckWordCount(dk) {
         const d = decks[dk];
         if (d.words) return d.words.length;
@@ -471,10 +520,17 @@
             mastered: false,
             familiar: false,
             lastSpellWrongDay: '',
-            uncertainPenalty: false
+            uncertainPenalty: false,
+            studyByDay: {},
+            wrongByDay: {},
+            consecutiveWrong: 0
           };
         }
-        return state.value.progress[k];
+        const pr = state.value.progress[k];
+        if (!pr.studyByDay) pr.studyByDay = {};
+        if (!pr.wrongByDay) pr.wrongByDay = {};
+        if (pr.consecutiveWrong == null) pr.consecutiveWrong = 0;
+        return pr;
       }
 
       function bumpStats(kind) {
@@ -512,9 +568,136 @@
       }
 
       function selectDeck(dk) {
+        if (lexiconBundlesLoading.value) {
+          showToast('词库正在加载，请稍候');
+          return;
+        }
         state.value.activeDeck = dk;
         persist();
-        startSession('deck');
+        buildPickPlanRows();
+        pickPlanSearchQ.value = '';
+        view.value = 'pickPlan';
+      }
+
+      function buildPickPlanRows() {
+        const goal = state.value.settings.dailyGoal || 20;
+        const y = new Date();
+        y.setDate(y.getDate() - 1);
+        const yKey = y.toISOString().slice(0, 10);
+        const dk = state.value.activeDeck || 'cet4';
+        const d = decks[dk];
+        let deckPool = d.words ? shuffle(d.words.slice()) : shuffle(Array.from(lexicon.value.keys()));
+        const seen = new Set();
+        const rows = [];
+        function pushRow(ent, tag) {
+          if (!ent || !ent.word) return;
+          const k = normWord(ent.word);
+          if (seen.has(k)) return;
+          seen.add(k);
+          rows.push({ entry: ent, tag, checked: true });
+        }
+        const keys = Array.from(lexicon.value.keys());
+        keys.forEach((k) => {
+          const pr = getProgress(k);
+          const s = pr.studyByDay[yKey] || 0;
+          const w = pr.wrongByDay[yKey] || 0;
+          if (s >= 2 && w >= 1) pushRow(lexicon.value.get(k), '昨日多轮/易错');
+          else if (s >= 3) pushRow(lexicon.value.get(k), '昨日高强度');
+        });
+        (state.value.tempWords || []).forEach((tw) => {
+          const ent = lexicon.value.get(normWord(tw));
+          if (ent) pushRow(ent, '近期搜索');
+        });
+        const targetPool = Math.min(deckPool.length, Math.max(goal * 2, goal + 15));
+        for (let i = 0; i < deckPool.length && rows.length < targetPool; i++) {
+          const ent = lexicon.value.get(normWord(deckPool[i]));
+          pushRow(ent, '词库随机');
+        }
+        if (rows.length < goal) {
+          for (let i = 0; i < keys.length && rows.length < goal; i++) {
+            pushRow(lexicon.value.get(keys[i]), '词库补充');
+          }
+        }
+        pickPlanRows.value = rows;
+      }
+
+      function togglePickRow(row) {
+        row.checked = !row.checked;
+      }
+
+      function togglePickAll(on) {
+        pickPlanRows.value.forEach((r) => { r.checked = on; });
+      }
+
+      function startPickedPlan() {
+        const picked = pickPlanRows.value.filter((r) => r.checked).map((r) => r.entry).filter(Boolean);
+        if (!picked.length) { showToast('请至少勾选一个单词'); return; }
+        sessionMode.value = 'deck';
+        sessionReviewAlternate.value = false;
+        metaChoice.value = null;
+        uncertain.value = false;
+        sessionQueue.value = picked;
+        sessionIndex.value = 0;
+        studyStart.value = Date.now();
+        view.value = 'learn';
+        resetHints();
+        scheduleMetaHint();
+        maybeAutoSpeak();
+      }
+
+      function pickPlanSearchOnline() {
+        const q = normWord(pickPlanSearchQ.value);
+        if (!q) { showToast('请输入要搜索的英文'); return; }
+        const local = lexicon.value.get(q);
+        if (local) {
+          const seen = new Set(pickPlanRows.value.map((r) => normWord(r.entry.word)));
+          if (!seen.has(q)) pickPlanRows.value = [{ entry: local, tag: '在线/搜索', checked: true }].concat(pickPlanRows.value);
+          addTempSearch(q);
+          showToast('已加入待选表');
+          return;
+        }
+        pickPlanSearchLoading.value = true;
+        const url = `http://124.222.204.22/api/zici/fanyiapihz.php?id=88888888&key=88888888&word=${encodeURIComponent(q)}`;
+        fetchJSON(url, 8000)
+          .then((j) => {
+            const zh = (j && (j.translation || j.data || j.result || j.msg)) || '';
+            if (!zh) { showToast('未找到释义'); return; }
+            const ent = {
+              word: q,
+              phonetic: '',
+              translation: String(zh),
+              definition: '',
+              exchange: '',
+              pos: '',
+              synonyms: '',
+              rootAffix: ''
+            };
+            const m = new Map(lexicon.value);
+            m.set(q, ent);
+            lexicon.value = m;
+            if (!state.value.lexiconExtra.find((x) => normWord(x.word) === q)) state.value.lexiconExtra.push(ent);
+            addTempSearch(q);
+            const seen = new Set(pickPlanRows.value.map((r) => normWord(r.entry.word)));
+            if (!seen.has(q)) pickPlanRows.value = [{ entry: ent, tag: '在线添加', checked: true }].concat(pickPlanRows.value);
+            persist();
+            showToast('已在线添加并加入待选表');
+          })
+          .catch(() => { showToast('网络超时或接口不可用'); })
+          .finally(() => { pickPlanSearchLoading.value = false; });
+      }
+
+      function calTouchStart(ev) {
+        const t = (ev.touches && ev.touches[0]) || ev;
+        calTouch.value = { x0: t.clientX, t0: Date.now() };
+      }
+
+      function calTouchEnd(ev) {
+        const t = (ev.changedTouches && ev.changedTouches[0]) || ev;
+        const dx = t.clientX - calTouch.value.x0;
+        const dt = Date.now() - calTouch.value.t0;
+        if (dt > 600 || Math.abs(dx) < 40) return;
+        if (dx < 0) calendarOffset.value += 7;
+        else calendarOffset.value = Math.max(0, calendarOffset.value - 7);
       }
 
       function buildPoolForDeck() {
@@ -575,6 +758,7 @@
           showToast('词库正在加载，请稍候');
           return;
         }
+        sessionReviewAlternate.value = false;
         sessionMode.value = mode;
         metaChoice.value = null;
         uncertain.value = false;
@@ -598,7 +782,10 @@
       function confirmLeaveStudy() {
         modalExitText.value = '确定退出学习？当前队列进度会保留。';
         modalExit.value = true;
-        window.__wwLeaveCb = () => { view.value = 'home'; };
+        window.__wwLeaveCb = () => {
+          sessionReviewAlternate.value = false;
+          view.value = 'home';
+        };
       }
 
       function modalExitOk() {
@@ -634,12 +821,19 @@
 
       function speak(text, accent) {
         try {
-          const u = new SpeechSynthesisUtterance(text);
+          const t = String(text || '').trim();
+          if (!t) return;
+          if (typeof speechSynthesis !== 'undefined' && speechSynthesis.resume) {
+            try { speechSynthesis.resume(); } catch (_) {}
+          }
+          const u = new SpeechSynthesisUtterance(t);
           u.lang = accent === 'UK' ? 'en-GB' : 'en-US';
-          u.rate = 0.95;
+          u.rate = 0.92;
           speechSynthesis.cancel();
           speechSynthesis.speak(u);
-        } catch { showToast('无法播放语音'); }
+        } catch (_) {
+          showToast('无法朗读（请再点一次发音按钮，或检查系统是否关闭 TTS）');
+        }
       }
 
       function toggleStar(word) {
@@ -671,10 +865,15 @@
           maybeAutoSpeak();
           return;
         }
-        if (kind === 'know') buildQuiz('word2zh');
-        else buildNextQuizType();
-        view.value = 'quiz';
         resetHints();
+        view.value = 'quiz';
+        if (kind === 'know') {
+          if (sessionReviewAlternate.value) buildQuiz('zh2word');
+          else buildQuiz('word2zh');
+        } else if (kind === 'unsure') {
+          if (sessionReviewAlternate.value) buildQuiz('listen2zh');
+          else buildNextQuizType();
+        } else buildNextQuizType();
         scheduleMetaHint();
         maybeAutoSpeak();
       }
@@ -682,9 +881,9 @@
       function afterUnknownCard() {
         bumpStats('learn');
         persist();
+        resetHints();
         view.value = 'quiz';
         buildQuiz('spell');
-        resetHints();
         maybeAutoSpeak();
       }
 
@@ -718,7 +917,7 @@
               return { pos: s.pos || '释义', text: s.text, ok: false };
             })
           ]);
-          quiz.value = { type, options: opts, locked: false, picked: null };
+          quiz.value = { type, options: opts, locked: false, picked: null, wrongStreak: 0 };
         } else if (type === 'zh2word') {
           const opts = shuffle([
             { word: e.word, ok: true },
@@ -729,7 +928,8 @@
             zhPrompt: `${correctSense.pos || ''} ${correctSense.text}`.trim(),
             options: opts,
             locked: false,
-            picked: null
+            picked: null,
+            wrongStreak: 0
           };
         } else if (type === 'multisense') {
           const senses = allSenses(e.translation);
@@ -762,26 +962,102 @@
         const url = `https://api.apihz.cn/getapi.php?id=88888888&key=88888888&keyword=${encodeURIComponent(w)}&num=1`;
         fetchJSON(url, 6000)
           .then((j) => {
-            const u = j && (j.pic || j.img || j.url || (j.data && j.data[0]));
-            hintImage.value = typeof u === 'string' ? u : '';
-            if (!hintImage.value) hintImage.value = placeholderImg();
+            const u = parseHzImage(j);
+            hintImage.value = u || placeholderImg();
           })
           .catch(() => { hintImage.value = placeholderImg(); })
           .finally(() => { apiLoading.value = false; });
       }
 
       function placeholderImg() {
-        return 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200"><rect fill="#e8e0dc" width="100%" height="100%"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#999" font-size="18">WordWise</text></svg>');
+        return 'data:image/svg+xml,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200"><rect fill="#e8e0dc" width="100%" height="100%"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#999" font-size="18">${APP_NAME}</text></svg>`);
       }
 
       function fetchImageFor(word) {
         const url = `https://api.apihz.cn/getapi.php?id=88888888&key=88888888&keyword=${encodeURIComponent(word)}&num=1`;
         return fetchJSON(url, 6000)
           .then((j) => {
-            const u = j && (j.pic || j.img || j.url || (j.data && j.data[0]));
-            return typeof u === 'string' ? u : placeholderImg();
+            const u = parseHzImage(j);
+            return u || placeholderImg();
           })
           .catch(() => placeholderImg());
+      }
+
+      function ensureWrongBookEntry(e, bumpCount) {
+        const wk = normWord(e.word);
+        if (!state.value.wrongBook[wk]) {
+          state.value.wrongBook[wk] = { wrongCount: 0, correctStreak: 0, translation: e.translation, display: e.word };
+        }
+        if (bumpCount) state.value.wrongBook[wk].wrongCount++;
+      }
+
+      function openDetailAfterThreeStrikes() {
+        const e = currentEntry.value;
+        if (!e) return;
+        ensureWrongBookEntry(e, true);
+        const pr = getProgress(e.word);
+        pr.consecutiveWrong = (pr.consecutiveWrong || 0) + 1;
+        detailEntry.value = e;
+        detailTab.value = 'def';
+        detailHighlightIdx.value = 0;
+        noteDraft.value = state.value.notes[normWord(e.word)] || '';
+        detailReturnView.value = 'quiz';
+        detailFromStrikes.value = true;
+        detailScreenImage.value = placeholderImg();
+        fetchImageFor(e.word).then((u) => { detailScreenImage.value = u; });
+        view.value = 'detail';
+        persist();
+      }
+
+      function continueQuizSameWord() {
+        detailFromStrikes.value = false;
+        detailScreenImage.value = '';
+        detailReturnView.value = null;
+        view.value = 'quiz';
+        resetHints();
+        if (sessionReviewAlternate.value && metaChoice.value === 'know') buildQuiz('zh2word');
+        else if (sessionReviewAlternate.value && metaChoice.value === 'unsure') buildQuiz('listen2zh');
+        else if (metaChoice.value === 'know') buildQuiz('word2zh');
+        else if (metaChoice.value === 'unsure') buildNextQuizType();
+        else buildQuiz('word2zh');
+        maybeAutoSpeak();
+      }
+
+      function nextWordFromDetail() {
+        detailFromStrikes.value = false;
+        detailScreenImage.value = '';
+        const ret = detailReturnView.value;
+        detailReturnView.value = null;
+        if (ret === 'feedback') {
+          nextAfterFeedback();
+          return;
+        }
+        if (ret === 'quiz') {
+          metaChoice.value = null;
+          uncertain.value = false;
+          if (sessionIndex.value < sessionQueue.value.length - 1) {
+            sessionIndex.value++;
+            view.value = 'learn';
+            resetHints();
+            scheduleMetaHint();
+            maybeAutoSpeak();
+          } else {
+            sessionReviewAlternate.value = false;
+            view.value = 'home';
+          }
+          return;
+        }
+        if (sessionIndex.value < sessionQueue.value.length - 1) {
+          sessionIndex.value++;
+          metaChoice.value = null;
+          uncertain.value = false;
+          view.value = 'learn';
+          resetHints();
+          scheduleMetaHint();
+          maybeAutoSpeak();
+        } else {
+          view.value = 'home';
+        }
       }
 
       function choiceClass(i) {
@@ -812,10 +1088,35 @@
 
       function pickChoice(i) {
         if (!quiz.value || quiz.value.locked) return;
-        quiz.value.picked = i;
-        quiz.value.locked = true;
-        const ok = quiz.value.options[i].ok;
-        finishQuiz(ok, quiz.value.options.find((o) => o.ok));
+        const qz = quiz.value;
+        const t = qz.type;
+        const o = qz.options[i];
+        const ok = o.ok;
+        const fourChoice = t === 'word2zh' || t === 'zh2word' || t === 'listen2zh';
+        if (!fourChoice) {
+          qz.picked = i;
+          qz.locked = true;
+          finishQuiz(ok, qz.options.find((x) => x.ok));
+          return;
+        }
+        if (ok) {
+          qz.picked = i;
+          qz.locked = true;
+          finishQuiz(true, o);
+          return;
+        }
+        qz.wrongStreak = (qz.wrongStreak || 0) + 1;
+        qz.picked = i;
+        qz.locked = true;
+        if (qz.wrongStreak >= 3) {
+          openDetailAfterThreeStrikes();
+          return;
+        }
+        setTimeout(() => {
+          if (!quiz.value || quiz.value !== qz) return;
+          qz.locked = false;
+          qz.picked = null;
+        }, 700);
       }
 
       function submitMulti() {
@@ -842,19 +1143,30 @@
       function finishQuiz(correct, expected) {
         const e = currentEntry.value;
         const pr = getProgress(e.word);
+        const d = todayISO();
+        const prevOk = pr.lastResult === 'ok';
+        const dueForgot = (pr.nextDue || d) <= d;
+        pr.studyByDay[d] = (pr.studyByDay[d] || 0) + 1;
         lastResult.value = { correct, expected: expected && (expected.text || expected.word) };
         feedbackImage.value = placeholderImg();
         fetchImageFor(e.word).then((u) => { feedbackImage.value = u; });
         if (!correct) {
+          pr.wrongByDay[d] = (pr.wrongByDay[d] || 0) + 1;
+          pr.consecutiveWrong = (pr.consecutiveWrong || 0) + 1;
           const wk = normWord(e.word);
           if (!state.value.wrongBook[wk]) state.value.wrongBook[wk] = { wrongCount: 0, correctStreak: 0, translation: e.translation, display: e.word };
           state.value.wrongBook[wk].wrongCount++;
           state.value.wrongBook[wk].correctStreak = 0;
+          if (prevOk && dueForgot && (pr.intervalIdx || 0) > 0) {
+            state.value.wrongBook[wk].wrongCount++;
+          }
+          if (pr.consecutiveWrong >= 5) ensureWrongBookEntry(e, false);
           pr.intervalIdx = 0;
-          pr.nextDue = todayISO();
-          pr.lastSpellWrongDay = todayISO();
+          pr.nextDue = d;
+          pr.lastSpellWrongDay = d;
           pr.knowPassDays = [];
         } else {
+          pr.consecutiveWrong = 0;
           const wk = normWord(e.word);
           const wb = state.value.wrongBook[wk];
           if (wb) {
@@ -862,7 +1174,6 @@
             if (wb.correctStreak >= 2) delete state.value.wrongBook[wk];
           }
           if (!uncertain.value && metaChoice.value === 'know' && correct) {
-            const d = todayISO();
             const arr = pr.knowPassDays || [];
             if (!arr.includes(d)) arr.push(d);
             pr.knowPassDays = arr.slice(-12);
@@ -896,7 +1207,10 @@
             ? `🎉 真是充实的一天！你学习了约 ${Math.round(minutes)} 分钟，今日已完成目标。`
             : `💪 今日任务尚不达标，还有约 ${Math.max(0, goal - learned)} 个单词在等你。`;
           modalExit.value = true;
-          window.__wwLeaveCb = () => { view.value = 'home'; };
+          window.__wwLeaveCb = () => {
+            sessionReviewAlternate.value = false;
+            view.value = 'home';
+          };
           return;
         }
         sessionIndex.value++;
@@ -908,19 +1222,60 @@
         maybeAutoSpeak();
       }
 
+      function tryMorningReview() {
+        if (lexiconBundlesLoading.value) return;
+        const t = todayISO();
+        if (state.value.morningReviewPromptDate === t) return;
+        const y = new Date();
+        y.setDate(y.getDate() - 1);
+        const yKey = y.toISOString().slice(0, 10);
+        const heavy = [];
+        lexicon.value.forEach((ent, k) => {
+          if (!ent) return;
+          const pr = getProgress(k);
+          const n = pr.studyByDay[yKey] || 0;
+          if (n >= 3) heavy.push(ent);
+        });
+        if (!heavy.length) return;
+        state.value.morningReviewPromptDate = t;
+        persist();
+        sessionReviewAlternate.value = true;
+        sessionMode.value = 'morning';
+        metaChoice.value = null;
+        uncertain.value = false;
+        sessionQueue.value = shuffle(heavy).slice(0, Math.min(heavy.length, state.value.settings.dailyGoal || 20));
+        sessionIndex.value = 0;
+        studyStart.value = Date.now();
+        view.value = 'learn';
+        resetHints();
+        scheduleMetaHint();
+        showToast('昨日高强度单词：今日已切换题型复习');
+        maybeAutoSpeak();
+      }
+
       function openDetailFromFeedback() {
         detailEntry.value = currentEntry.value;
         detailTab.value = 'def';
         detailHighlightIdx.value = 0;
         noteDraft.value = state.value.notes[normWord(detailEntry.value.word)] || '';
         detailReturnView.value = 'feedback';
+        detailFromStrikes.value = false;
+        detailScreenImage.value = placeholderImg();
+        fetchImageFor(detailEntry.value.word).then((u) => { detailScreenImage.value = u; });
         view.value = 'detail';
       }
 
       function closeDetail() {
-        if (detailReturnView.value) {
-          view.value = detailReturnView.value;
-          detailReturnView.value = null;
+        detailScreenImage.value = '';
+        const ret = detailReturnView.value;
+        detailReturnView.value = null;
+        detailFromStrikes.value = false;
+        if (ret === 'feedback') {
+          view.value = 'feedback';
+          return;
+        }
+        if (ret === 'quiz') {
+          continueQuizSameWord();
           return;
         }
         view.value = sessionQueue.value.length ? 'learn' : 'home';
@@ -956,7 +1311,7 @@
           .then((j) => {
             const zh = (j && (j.translation || j.data || j.result || j.msg)) || '';
             if (!zh) { searchError.value = '未找到释义'; return; }
-            const ent = { word: q, phonetic: '', translation: String(zh), definition: '', exchange: '', pos: '' };
+            const ent = { word: q, phonetic: '', translation: String(zh), definition: '', exchange: '', pos: '', synonyms: '', rootAffix: '' };
             lexicon.value.set(q, ent);
             searchResult.value = ent;
             state.value.lexiconExtra.push(ent);
@@ -980,13 +1335,26 @@
         showToast('已加入生词本');
       }
 
-      function exportWrong() {
+      function exportWrong(mode) {
         const rows = wrongList.value;
-        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>错题集</title>
+        const esc = (s) => String(s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const m = mode || 'both';
+        let head;
+        let body;
+        if (m === 'en') {
+          head = '<tr><th>英文</th></tr>';
+          body = rows.map((r) => `<tr><td>${esc(r.word)}</td></tr>`).join('');
+        } else if (m === 'zh') {
+          head = '<tr><th>中文释义</th></tr>';
+          body = rows.map((r) => `<tr><td>${esc(r.translation)}</td></tr>`).join('');
+        } else {
+          head = '<tr><th>英文</th><th>释义</th><th>错误次数</th></tr>';
+          body = rows.map((r) => `<tr><td>${esc(r.word)}</td><td>${esc(r.translation)}</td><td>${r.wrongCount}</td></tr>`).join('');
+        }
+        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>${APP_NAME} 错题</title>
           <style>body{font-family:system-ui;padding:24px;}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:8px;text-align:left}</style></head><body>
-          <h1>WordWise 错题集</h1><table><tr><th>单词</th><th>释义</th><th>错误次数</th></tr>
-          ${rows.map((r) => `<tr><td>${r.word}</td><td>${(r.translation || '').replace(/</g, '&lt;')}</td><td>${r.wrongCount}</td></tr>`).join('')}
-          </table><script>window.onload=function(){window.print()}<\/script></body></html>`;
+          <h1>${APP_NAME} · 错题导出</h1><table>${head}${body}</table>
+          <script>window.onload=function(){window.print()}<\/script></body></html>`;
         const w = window.open('', '_blank');
         if (w) { w.document.write(html); w.document.close(); }
         else showToast('请允许弹窗以导出');
@@ -1005,8 +1373,13 @@
       function mergeLexicon(entries) {
         const m = new Map(lexicon.value);
         entries.forEach((e) => {
-          m.set(normWord(e.word), e);
-          if (!state.value.lexiconExtra.find((x) => normWord(x.word) === normWord(e.word))) state.value.lexiconExtra.push(e);
+          const ent = {
+            ...e,
+            synonyms: e.synonyms != null ? e.synonyms : '',
+            rootAffix: e.rootAffix != null ? e.rootAffix : ''
+          };
+          m.set(normWord(ent.word), ent);
+          if (!state.value.lexiconExtra.find((x) => normWord(x.word) === normWord(ent.word))) state.value.lexiconExtra.push(ent);
         });
         lexicon.value = m;
         persist();
@@ -1084,6 +1457,7 @@
             if ('serviceWorker' in navigator) {
               navigator.serviceWorker.register('wordwise-sw.js').catch(() => {});
             }
+            tryMorningReview();
           });
       });
 
@@ -1125,6 +1499,10 @@
         detailDefLines,
         detailCollocations,
         relatedWords,
+        detailSynonymsLine,
+        detailRootAffixLine,
+        detailScreenImage,
+        detailFromStrikes,
         fold,
         noteDraft,
         searchQ,
@@ -1138,6 +1516,17 @@
         afterUnknownCard,
         doSignIn,
         selectDeck,
+        pickPlanRows,
+        pickPlanSearchQ,
+        pickPlanSearchLoading,
+        pickPlanSearchOnline,
+        togglePickAll,
+        startPickedPlan,
+        calTouchStart,
+        calTouchEnd,
+        calendarOffset,
+        continueQuizSameWord,
+        nextWordFromDetail,
         deckWordCount,
         startSession,
         confirmLeaveStudy,
